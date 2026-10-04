@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sql-query-planner"
+version = "0.1.0"
+description = "SQL parsing, logical rewriting and cost-based physical planning (stdlib only)"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.scripts]
+sql-query-planner = "sqlplan.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["sqlplan*"]
