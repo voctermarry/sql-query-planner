@@ -228,6 +228,42 @@ class JoinExecutionTests(unittest.TestCase):
         self.assertEqual([row["count(*)"] for row in rows], [2, 2, 1])
         self.assertEqual(rows[0]["sum(amount)"], 400.0)
 
+    def test_min_max_over_strings_and_numbers_on_a_join(self) -> None:
+        sql = (
+            "SELECT min(orders.note), max(orders.note), min(orders.amount), max(orders.amount), count(*) "
+            "FROM orders INNER JOIN customers ON orders.cid = customers.cid"
+        )
+        columns, rows = execute(plan(parse(sql), catalog()).physical, tables())
+        self.assertEqual(columns, ["min(note)", "max(note)", "min(amount)", "max(amount)", "count(*)"])
+        self.assertEqual(rows[0]["min(note)"], "x")
+        self.assertEqual(rows[0]["max(note)"], "z")
+        self.assertEqual(rows[0]["min(amount)"], 100.0)
+        self.assertEqual(rows[0]["max(amount)"], 300.0)
+        self.assertEqual(rows[0]["count(*)"], 5)
+
+    def test_grouped_min_max_over_a_join_ignores_nulls(self) -> None:
+        sql = (
+            "SELECT customers.name, min(orders.note), max(orders.amount) FROM orders "
+            "INNER JOIN customers ON orders.cid = customers.cid GROUP BY customers.name ORDER BY customers.name"
+        )
+        _, rows = execute(plan(parse(sql), catalog()).physical, tables())
+        # cid 10 has two customers ("a", "a2"), each joining orders 1 (x/100) and 3 (z/300); cid 20 is "b"
+        self.assertEqual(rows, [
+            {"name": "a", "min(note)": "x", "max(amount)": 300.0},
+            {"name": "a2", "min(note)": "x", "max(amount)": 300.0},
+            {"name": "b", "min(note)": "y", "max(amount)": 200.0},
+        ])
+
+    def test_min_max_agrees_between_indexed_and_plain_join_plans(self) -> None:
+        sql = (
+            "SELECT customers.name, min(orders.note), max(orders.amount) FROM orders "
+            "INNER JOIN customers ON orders.cid = customers.cid GROUP BY customers.name"
+        )
+        statement = parse(sql)
+        indexed = execute(plan(statement, catalog(right_indexes=("cid",))).physical, tables())
+        plain = execute(plan(statement, catalog()).physical, tables())
+        self.assertEqual(indexed, plain)
+
     def test_residual_cross_side_filter_is_applied(self) -> None:
         sql = (
             "SELECT orders.id FROM orders INNER JOIN customers ON orders.cid = customers.cid "
@@ -235,8 +271,6 @@ class JoinExecutionTests(unittest.TestCase):
         )
         _, rows = execute(plan(parse(sql), catalog()).physical, tables())
         self.assertEqual([row["id"] for row in rows], [])
-
-    def test_limit_over_a_join(self) -> None:
         _, rows = execute(
             plan(parse(JOIN_SQL + " ORDER BY orders.id LIMIT 2"), catalog(right_indexes=("cid",))).physical,
             tables(),

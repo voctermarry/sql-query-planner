@@ -136,6 +136,59 @@ class CLITests(unittest.TestCase):
         self.assertEqual(document["error"], "validation_error")
         self.assertEqual(document["line"], 2)
 
+    def _write_table(self, name: str, rows: list[dict]) -> str:
+        path = os.path.join(self.directory.name, name)
+        with open(path, "w", encoding="utf-8", newline="\n") as handle:
+            for row in rows:
+                handle.write(json.dumps(row) + "\n")
+        return path
+
+    def test_run_min_max_on_strings_and_typed_numbers(self) -> None:
+        path = self._write_table("typed.jsonl", [{"id": 1, "region": "us", "amount": 10}, {"id": 2, "region": "eu", "amount": 2}, {"id": 3, "region": None, "amount": None}])
+        code, out, err = run_cli(["run", "--sql", "SELECT min(region), max(region), min(amount), max(amount) FROM orders", "--table", path])
+        self.assertEqual((code, err), (EXIT_OK, ""))
+        self.assertEqual(json.loads(out)["rows"], [{"min(region)": "eu", "max(region)": "us", "min(amount)": 2, "max(amount)": 10}])
+
+    def test_mixed_min_max_inputs_exit_two_with_one_validation_error(self) -> None:
+        path = self._write_table("mixed.jsonl", [{"v": "a"}, {"v": 1}])
+        for command, sql in (("run", "SELECT min(v) FROM orders"), ("reconcile", "SELECT max(v) FROM orders")):
+            with self.subTest(command=command):
+                code, out, err = run_cli([command, "--sql", sql, "--table", path])
+                self.assertEqual(code, EXIT_ERROR)
+                self.assertEqual(out, "")
+                self.assertEqual(err.count("\n"), 1)
+                document = json.loads(err)
+                self.assertEqual(document["error"], "validation_error")
+                self.assertIn("v", document["message"])
+
+    def test_boolean_and_complex_min_max_inputs_are_validation_errors(self) -> None:
+        cases = [("bools.jsonl", [{"v": True}, {"v": False}]), ("arrays.jsonl", [{"v": [1, 2]}]), ("objects.jsonl", [{"v": {"x": 1}}])]
+        for name, rows in cases:
+            path = self._write_table(name, rows)
+            with self.subTest(name=name):
+                code, out, err = run_cli(["run", "--sql", "SELECT min(v) FROM orders", "--table", path])
+                self.assertEqual((code, out.count("\n")), (EXIT_ERROR, 0))
+                document = json.loads(err)
+                self.assertEqual(document["error"], "validation_error")
+                self.assertIn("min", document["message"])
+
+    def test_failed_validation_leaves_an_existing_output_file_untouched(self) -> None:
+        path = self._write_table("mixed.jsonl", [{"v": "a"}, {"v": 1}])
+        target = os.path.join(self.directory.name, "out.json")
+        with open(target, "w", encoding="utf-8") as handle:
+            handle.write("PRIOR")
+        code, out, _ = run_cli(["run", "--sql", "SELECT min(v) FROM orders", "--table", path, "--output", target])
+        self.assertEqual(code, EXIT_ERROR)
+        self.assertEqual(out, "")
+        with open(target, encoding="utf-8") as handle:
+            self.assertEqual(handle.read(), "PRIOR")
+
+    def test_all_null_min_max_is_a_valid_null_result(self) -> None:
+        path = self._write_table("nulls.jsonl", [{"v": None}, {"v": None}])
+        code, out, err = run_cli(["run", "--sql", "SELECT min(v), max(v), count(*) FROM orders", "--table", path])
+        self.assertEqual((code, err), (EXIT_OK, ""))
+        self.assertEqual(json.loads(out)["rows"], [{"min(v)": None, "max(v)": None, "count(*)": 2}])
+
 
 class JoinCLITests(unittest.TestCase):
     JOIN_SQL = "SELECT orders.id, customers.name FROM orders INNER JOIN customers ON orders.cid = customers.cid"
@@ -188,6 +241,21 @@ class JoinCLITests(unittest.TestCase):
         document = json.loads(out)
         self.assertEqual(document["columns"], ["id", "name"])
         self.assertEqual(len(document["rows"]), 3)
+
+    def test_min_max_over_a_join_reconciles_between_plans(self) -> None:
+        sql = (
+            "SELECT min(customers.name), max(customers.name), min(orders.amount), max(orders.amount) "
+            "FROM orders INNER JOIN customers ON orders.cid = customers.cid"
+        )
+        code, out, err = run_cli(["reconcile", "--sql", sql, *self.bindings(), "--index", "orders.cid"])
+        self.assertEqual((code, err), (EXIT_OK, ""))
+        self.assertTrue(json.loads(out)["identical"])
+        code, out, err = run_cli(["run", "--sql", sql, *self.bindings()])
+        self.assertEqual((code, err), (EXIT_OK, ""))
+        self.assertEqual(
+            json.loads(out)["rows"],
+            [{"min(name)": "n1", "max(name)": "n3", "min(amount)": 1.0, "max(amount)": 60.0}],
+        )
 
     def test_reconcile_reports_both_join_operators_and_orders(self) -> None:
         sql = "SELECT customers.name, orders.id FROM customers INNER JOIN orders ON customers.cid = orders.cid"

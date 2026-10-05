@@ -107,6 +107,28 @@ def _load_rows(path: str) -> list[dict[str, Any]]:
     return rows
 
 
+def _distinct_count(values: Any) -> int:
+    """Distinct-value statistic for one column.
+
+    Statistics are computed before any operator validates value types, so arrays and objects (legal
+    JSONL, rejected by MIN/MAX at execution) must not blow the count up with a TypeError: hashable
+    values use a set as usual, and only when an unhashable value appears do they fall back to a
+    tagged JSON form for those values.
+    """
+    values = list(values)
+    try:
+        return len(set(values))
+    except TypeError:
+        pass
+    seen: set[Any] = set()
+    for value in values:
+        try:
+            seen.add(value)
+        except TypeError:
+            seen.add(("__unhashable__", json.dumps(value, sort_keys=True, default=str)))
+    return len(seen)
+
+
 def _table_bindings(statement: Any, values: Sequence[str]) -> list[tuple[str, str]]:
     """Resolve repeatable --table values to (name, path) pairs in FROM order.
 
@@ -169,7 +191,7 @@ def _catalog_and_tables(
             for column in row:
                 if column not in columns:
                     columns.append(column)
-        distinct = {column: len({row.get(column) for row in rows}) for column in columns}
+        distinct = {column: _distinct_count(row.get(column) for row in rows) for column in columns}
         catalog.add(
             TableInfo(
                 name=name,

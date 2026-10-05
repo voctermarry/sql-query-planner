@@ -83,6 +83,13 @@ planner is not "always prefer the index".
 * **stable join output** — duplicate join keys produce the full cross product, a null key matches
   nothing, and without `ORDER BY` rows come out in logical-left original order then right original
   order for every physical algorithm
+* **typed `min`/`max`** — both ignore `NULL` (a group with no non-NULL input yields `NULL`); when
+  every non-NULL value is a JSON number they compare numerically (integers and decimals may mix) and
+  return the chosen row's original representation, keeping the first-seen value on a numeric tie;
+  when every value is a string they compare in the order `ORDER BY` uses and return the original
+  string. `DISTINCT` and duplicate values never change an extreme, and the presence of `NULL` never
+  changes `count`/`sum`/`avg`. Mixed numbers and strings, or booleans, arrays and objects, are a
+  `validation_error` naming the aggregate and column — never a leaked `TypeError`/`ValueError`
 
 `reconcile` is the guarantee that matters: the same statement executed through different physical
 plans must produce identical columns and rows. It reports `identical`, both plans' `accessPath`,

@@ -168,5 +168,126 @@ class ExecutionTests(unittest.TestCase):
         self.assertEqual(rows, [{"count(*)": 0}])
 
 
+def _execute_on(columns, rows, sql):
+    built = Catalog()
+    distinct = {}
+    for column in columns:
+        try:
+            distinct[column] = len({row.get(column) for row in rows})
+        except TypeError:
+            # arrays/objects are legal JSONL rows; statistics tolerate them, MIN/MAX rejects them
+            distinct[column] = len({repr(row.get(column)) for row in rows})
+    built.add(TableInfo(name="orders", columns=columns, rows=len(rows), distinct=distinct))
+    table = Table("orders", columns, [dict(row) for row in rows])
+    return execute(plan(parse(sql), built).physical, table)
+
+
+class MinMaxSemanticsTests(unittest.TestCase):
+    def test_integer_extreme_keeps_the_integer_representation(self) -> None:
+        rows = [{"v": 10}, {"v": 2}, {"v": 3}]
+        columns, result = _execute_on(("v",), rows, "SELECT min(v), max(v) FROM orders")
+        self.assertEqual(columns, ["min(v)", "max(v)"])
+        self.assertEqual(result, [{"min(v)": 2, "max(v)": 10}])
+        self.assertIsInstance(result[0]["min(v)"], int)
+        self.assertIsInstance(result[0]["max(v)"], int)
+
+    def test_numbers_mix_integers_and_decimals_and_return_the_selected_value(self) -> None:
+        rows = [{"v": 10}, {"v": 2.5}, {"v": 3}]
+        _, result = _execute_on(("v",), rows, "SELECT min(v), max(v) FROM orders")
+        self.assertEqual(result[0]["min(v)"], 2.5)
+        self.assertEqual(result[0]["max(v)"], 10)
+        self.assertIsInstance(result[0]["min(v)"], float)
+        self.assertIsInstance(result[0]["max(v)"], int)
+
+    def test_numerically_equal_values_keep_the_first_seen(self) -> None:
+        from sqlplan.executor import aggregate_value
+
+        self.assertEqual(aggregate_value("min", [2, 2.0], False), 2)
+        self.assertIsInstance(aggregate_value("min", [2, 2.0], False), int)
+        self.assertEqual(aggregate_value("max", [2.0, 2], False), 2.0)
+        self.assertEqual(aggregate_value("min", [2.0, 2], False), 2.0)
+
+    def test_strings_use_sort_order_and_return_the_original(self) -> None:
+        rows = [{"region": "us"}, {"region": "eu"}, {"region": "apac"}]
+        _, result = _execute_on(("region",), rows, "SELECT min(region), max(region) FROM orders")
+        self.assertEqual(result, [{"min(region)": "apac", "max(region)": "us"}])
+
+    def test_null_is_ignored_and_an_all_null_group_is_null(self) -> None:
+        rows = [
+            {"g": "a", "v": 3},
+            {"g": "a", "v": None},
+            {"g": "a", "v": 1},
+            {"g": "b", "v": None},
+        ]
+        _, result = _execute_on(("g", "v"), rows, "SELECT g, min(v), max(v) FROM orders GROUP BY g ORDER BY g")
+        self.assertEqual(result, [
+            {"g": "a", "min(v)": 1, "max(v)": 3},
+            {"g": "b", "min(v)": None, "max(v)": None},
+        ])
+
+    def test_global_extreme_over_zero_rows_is_null_but_count_still_counts(self) -> None:
+        rows = [{"v": 1}]
+        _, result = _execute_on(("v",), rows, "SELECT count(*), min(v), max(v) FROM orders WHERE v > 100")
+        self.assertEqual(result, [{"count(*)": 0, "min(v)": None, "max(v)": None}])
+
+    def test_distinct_and_duplicates_do_not_change_extremes(self) -> None:
+        rows = [{"region": "us"}, {"region": "us"}, {"region": "eu"}, {"region": "apac"}]
+        _, distinct_result = _execute_on(("region",), rows, "SELECT min(DISTINCT region), max(DISTINCT region) FROM orders")
+        _, plain_result = _execute_on(("region",), rows, "SELECT min(region), max(region) FROM orders")
+        self.assertEqual(
+            [distinct_result[0]["min(DISTINCT region)"], distinct_result[0]["max(DISTINCT region)"]],
+            [plain_result[0]["min(region)"], plain_result[0]["max(region)"]],
+        )
+        self.assertEqual(distinct_result[0]["min(DISTINCT region)"], "apac")
+        self.assertEqual(distinct_result[0]["max(DISTINCT region)"], "us")
+
+    def test_nulls_do_not_affect_count_sum_avg(self) -> None:
+        rows = [{"v": 10}, {"v": 2}, {"v": None}]
+        _, result = _execute_on(("v",), rows, "SELECT count(*), count(v), sum(v), avg(v), min(v), max(v) FROM orders")
+        record = result[0]
+        self.assertEqual(record["count(*)"], 3)
+        self.assertEqual(record["count(v)"], 2)
+        self.assertEqual(record["sum(v)"], 12.0)
+        self.assertEqual(record["avg(v)"], 6.0)
+        self.assertEqual(record["min(v)"], 2)
+        self.assertEqual(record["max(v)"], 10)
+
+    def test_aliased_extremes_share_the_same_rules(self) -> None:
+        rows = [{"region": "us"}, {"region": "eu"}]
+        columns, result = _execute_on(("region",), rows, "SELECT min(region) AS lo, max(region) AS hi FROM orders")
+        self.assertEqual(columns, ["lo", "hi"])
+        self.assertEqual(result, [{"lo": "eu", "hi": "us"}])
+
+    def test_mixed_numbers_and_strings_is_a_validation_error(self) -> None:
+        rows = [{"v": "a"}, {"v": 1}]
+        with self.assertRaises(ValidationError) as caught:
+            _execute_on(("v",), rows, "SELECT min(v) FROM orders")
+        self.assertEqual(caught.exception.kind, "validation_error")
+        self.assertIn("min", caught.exception.message)
+        self.assertIn("v", caught.exception.message)
+        self.assertEqual(caught.exception.context.get("aggregate"), "min")
+
+    def test_booleans_are_never_numbers(self) -> None:
+        for sql in ("SELECT min(v) FROM orders", "SELECT max(v) FROM orders"):
+            with self.subTest(sql=sql):
+                with self.assertRaises(ValidationError):
+                    _execute_on(("v",), [{"v": True}, {"v": 1}], sql)
+            with self.subTest(sql=sql, booleans=True):
+                with self.assertRaises(ValidationError):
+                    _execute_on(("v",), [{"v": True}, {"v": False}], sql)
+
+    def test_arrays_and_objects_are_validation_errors_not_type_errors(self) -> None:
+        for value in ([1, 2], {"x": 1}):
+            with self.subTest(value=value):
+                with self.assertRaises(ValidationError):
+                    _execute_on(("v",), [{"v": value}], "SELECT min(v) FROM orders")
+
+    def test_validation_is_per_group_and_names_the_column(self) -> None:
+        rows = [{"g": "a", "v": 1}, {"g": "b", "v": "x"}, {"g": "b", "v": 2}]
+        with self.assertRaises(ValidationError) as caught:
+            _execute_on(("g", "v"), rows, "SELECT g, min(v) FROM orders GROUP BY g")
+        self.assertIn("v", caught.exception.message)
+
+
 if __name__ == "__main__":
     unittest.main()

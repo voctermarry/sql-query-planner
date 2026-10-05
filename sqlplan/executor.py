@@ -112,7 +112,7 @@ def _truthy(value: object) -> bool:
     return value is True
 
 
-def aggregate_value(function: str, values: list[object], distinct: bool) -> object:
+def aggregate_value(function: str, values: list[object], distinct: bool, column: str | None = None) -> object:
     if distinct:
         seen: list[object] = []
         for value in values:
@@ -124,16 +124,61 @@ def aggregate_value(function: str, values: list[object], distinct: bool) -> obje
         return len(present)
     if not present:
         return None
+    if function in ("min", "max"):
+        return _extreme_value(function, present, column)
     numbers = [float(value) for value in present]  # type: ignore[arg-type]
     if function == "sum":
         return sum(numbers)
-    if function == "min":
-        return min(numbers)
-    if function == "max":
-        return max(numbers)
     if function == "avg":
         return sum(numbers) / len(numbers)
     raise ValidationError(f"unknown aggregate: {function}")
+
+
+def _extreme_kind(value: object) -> str:
+    """The MIN/MAX type family of one non-NULL value.
+
+    Booleans have their own kind even though Python lets them behave as ints: they must not take part
+    as numbers. JSON arrays and objects are unsupported outright.
+    """
+    if isinstance(value, bool):
+        return "boolean"
+    if isinstance(value, (int, float)):
+        return "number"
+    if isinstance(value, str):
+        return "string"
+    if isinstance(value, list):
+        return "array"
+    if isinstance(value, dict):
+        return "object"
+    return "unsupported"
+
+
+def _extreme_value(function: str, values: list[object], column: str | None) -> object:
+    """MIN/MAX with type-correct semantics.
+
+    All non-NULL inputs must share one family: JSON numbers compared by numeric value (integers and
+    decimals mixed), or strings compared in the string order ORDER BY uses. The selected value is
+    returned as it appeared in the input row, never coerced, and a numeric tie keeps the value seen
+    first. Mixed families and unsupported values are validation errors rather than TypeError leaks.
+    """
+    where = f" in column {column!r}" if column else ""
+    kinds = {_extreme_kind(value) for value in values}
+    unsupported = kinds - {"number", "string"}
+    if unsupported:
+        kind = next(_extreme_kind(value) for value in values if _extreme_kind(value) in unsupported)
+        raise ValidationError(f"{function}() does not accept {kind} values{where}", aggregate=function, column=column)
+    if len(kinds) > 1:
+        raise ValidationError(
+            f"{function}() cannot mix numbers and strings{where}", aggregate=function, column=column
+        )
+    # Every non-NULL value shares one family, so plain comparison is numeric for numbers and the
+    # ORDER BY string order for strings; ties are not "better", so the first-seen value survives.
+    chosen = values[0]
+    for value in values[1:]:
+        better = value < chosen if function == "min" else value > chosen  # type: ignore[operator]
+        if better:
+            chosen = value
+    return chosen
 
 
 def _projection_label(projection: Projection) -> str:
@@ -198,7 +243,9 @@ def _execute(
             record: dict[str, object] = {name: value for name, value in zip(labels, key)}
             for function in node.aggregates:
                 values = [_aggregate_input(function, member) for member in members]
-                record[_aggregate_label(function)] = aggregate_value(function.function, values, function.distinct)
+                argument = function.argument
+                column = argument.name if isinstance(argument, Column) else None
+                record[_aggregate_label(function)] = aggregate_value(function.function, values, function.distinct, column)
             output.append(record)
         return names, output, None
     if isinstance(node, PhysicalProject):
