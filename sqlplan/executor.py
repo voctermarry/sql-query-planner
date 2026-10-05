@@ -1,20 +1,24 @@
-"""Execution of a physical plan over one in-memory table.
+"""Execution of physical plans over in-memory tables.
 
 The executor is deliberately separate from the planner: the same logical query can be executed through
 different physical plans, and the reconciliation command exists to prove they agree. Index scans build
 their index on first use and cache it on the table, so `index-scan` is a real access path rather than a
-label.
+label. Joins come in two physical flavours (hash join, index nested loop); both emit rows in the same
+canonical order -- left input in its original row order, and within one left row the right input in its
+original row order -- so the algorithm choice never changes the result.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Iterable
+from typing import Iterable, Mapping
 
 from .errors import PlanError, ValidationError
 from .parser import Aggregate, BoolOp, Column, Comparison, InList, IsNull, Literal, Not, Projection, Star
 from .planner import (
     FullScan,
+    HashJoin,
+    IndexNestedLoop,
     IndexScan,
     PhysicalAggregate,
     PhysicalFilter,
@@ -48,9 +52,13 @@ def evaluate(node: object, row: dict[str, object]) -> object:
     if isinstance(node, Literal):
         return node.value
     if isinstance(node, Column):
-        if node.name not in row:
-            raise PlanError(f"column not present in row: {node.name}", known=sorted(row))
-        return row[node.name]
+        if node.table:
+            qualified = f"{node.table}.{node.name}"
+            if qualified in row:
+                return row[qualified]
+        if node.name in row:
+            return row[node.name]
+        raise PlanError(f"column not present in row: {node.name}", known=sorted(row))
     if isinstance(node, Comparison):
         left, right = evaluate(node.left, row), evaluate(node.right, row)
         if left is None or right is None:
@@ -129,19 +137,79 @@ def _projection_label(projection: Projection) -> str:
     return "expression"
 
 
-def execute(node: object, table: Table) -> tuple[list[str], list[dict[str, object]]]:
+def execute(node: object, tables: object) -> tuple[list[str], list[dict[str, object]]]:
+    """Run a physical plan. `tables` is one Table (single-table plans) or a name -> Table mapping."""
+    if isinstance(tables, Table):
+        tables = {tables.name: tables}
+    return _execute(node, tables)  # type: ignore[arg-type]
+
+
+def _table_for_node(tables: Mapping[str, Table], name: str) -> Table:
+    if name not in tables:
+        raise PlanError(f"no rows loaded for table: {name}", known=sorted(tables))
+    return tables[name]
+
+
+def _execute(node: object, tables: Mapping[str, Table]) -> tuple[list[str], list[dict[str, object]]]:
     if isinstance(node, FullScan):
-        rows = [{column: row.get(column) for column in node.columns} for row in table.rows]
-        return list(node.columns), rows
+        table = _table_for_node(tables, node.table)
+        names = [f"{node.table}.{column}" for column in node.columns] if node.qualify else list(node.columns)
+        rows = [{name: row.get(column) for name, column in zip(names, node.columns)} for row in table.rows]
+        return names, rows
     if isinstance(node, IndexScan):
+        table = _table_for_node(tables, node.table)
         positions = table.index_for(node.column).get(node.value, [])
-        rows = [{column: table.rows[position].get(column) for column in node.columns} for position in positions]
-        return list(node.columns), rows
+        names = [f"{node.table}.{column}" for column in node.columns] if node.qualify else list(node.columns)
+        rows = [{name: table.rows[position].get(column) for name, column in zip(names, node.columns)} for position in positions]
+        return names, rows
+    if isinstance(node, HashJoin):
+        _, left_rows = _execute(node.left, tables)
+        _, right_rows = _execute(node.right, tables)
+        build_rows, build_key = (left_rows, node.left_key) if node.build == "left" else (right_rows, node.right_key)
+        probe_rows, probe_key = (right_rows, node.right_key) if node.build == "left" else (left_rows, node.left_key)
+        hashed: dict[object, list[int]] = {}
+        for position, row in enumerate(build_rows):
+            key = row.get(build_key)
+            if key is None:
+                continue  # a null join key never matches
+            hashed.setdefault(key, []).append(position)
+        pairs: list[tuple[int, int]] = []
+        for probe_position, row in enumerate(probe_rows):
+            key = row.get(probe_key)
+            if key is None:
+                continue
+            for build_position in hashed.get(key, ()):
+                pairs.append((build_position, probe_position) if node.build == "left" else (probe_position, build_position))
+        pairs.sort()  # canonical order: left row order, then right row order within one left row
+        merged = [{**left_rows[left], **right_rows[right]} for left, right in pairs]
+        return list(node.columns), merged
+    if isinstance(node, IndexNestedLoop):
+        _, outer_rows = _execute(node.outer, tables)
+        inner_table = _table_for_node(tables, node.inner_table)
+        index = inner_table.index_for(node.inner_key)
+        pairs = []
+        for outer_position, outer_row in enumerate(outer_rows):
+            key = outer_row.get(node.outer_key)
+            if key is None:
+                continue  # a null join key never matches
+            for inner_position in index.get(key, []):
+                raw = inner_table.rows[inner_position]
+                inner_row = {f"{node.inner_table}.{column}": raw.get(column) for column in node.inner_columns}
+                if node.inner_predicate is not None and not _truthy(evaluate(node.inner_predicate, inner_row)):
+                    continue
+                left, right = (outer_position, inner_position) if node.outer_is_left else (inner_position, outer_position)
+                pairs.append((left, right, outer_row, inner_row))
+        pairs.sort(key=lambda pair: (pair[0], pair[1]))
+        merged = [
+            ({**outer, **inner} if node.outer_is_left else {**inner, **outer})
+            for _, _, outer, inner in pairs
+        ]
+        return list(node.columns), merged
     if isinstance(node, PhysicalFilter):
-        columns, rows = execute(node.input, table)
+        columns, rows = _execute(node.input, tables)
         return columns, [row for row in rows if _truthy(evaluate(node.predicate, row))]
     if isinstance(node, PhysicalAggregate):
-        columns, rows = execute(node.input, table)
+        columns, rows = _execute(node.input, tables)
         names = list(node.group_by) + [_aggregate_label(function) for function in node.aggregates]
         groups: dict[tuple[object, ...], list[dict[str, object]]] = {}
         for row in rows:
@@ -158,13 +226,13 @@ def execute(node: object, table: Table) -> tuple[list[str], list[dict[str, objec
             output.append(record)
         return names, output
     if isinstance(node, PhysicalProject):
-        columns, rows = execute(node.input, table)
+        columns, rows = _execute(node.input, tables)
         aggregates = [projection for projection in node.projections if isinstance(projection.expression, Aggregate)]
         if aggregates:
             # aggregates were computed by PhysicalAggregate, which names them "<fn>(<arg>)"
-            output: list[dict[str, object]] = []
+            output = []
             for row in rows:
-                record: dict[str, object] = {}
+                record = {}
                 for projection in node.projections:
                     expression = projection.expression
                     if isinstance(expression, Star):
@@ -172,14 +240,14 @@ def execute(node: object, table: Table) -> tuple[list[str], list[dict[str, objec
                     elif isinstance(expression, Aggregate):
                         record[_projection_label(projection)] = row.get(_aggregate_label(expression))
                     elif isinstance(expression, Column):
-                        record[_projection_label(projection)] = row.get(expression.name)
+                        record[_projection_label(projection)] = _column_lookup(expression, row)
                     else:
                         record[_projection_label(projection)] = evaluate(expression, row)
                 output.append(record)
             return [_projection_label(projection) for projection in node.projections], output
         output = []
         for row in rows:
-            record: dict[str, object] = {}
+            record = {}
             for projection in node.projections:
                 expression = projection.expression
                 if isinstance(expression, Star):
@@ -189,7 +257,7 @@ def execute(node: object, table: Table) -> tuple[list[str], list[dict[str, objec
             output.append(record)
         return [_projection_label(projection) for projection in node.projections], output
     if isinstance(node, PhysicalSort):
-        columns, rows = execute(node.input, table)
+        columns, rows = _execute(node.input, tables)
 
         def sort_key(row: dict[str, object]) -> tuple:
             key: list[object] = []
@@ -203,9 +271,18 @@ def execute(node: object, table: Table) -> tuple[list[str], list[dict[str, objec
 
         return columns, sorted(rows, key=sort_key)
     if isinstance(node, PhysicalLimit):
-        columns, rows = execute(node.input, table)
+        columns, rows = _execute(node.input, tables)
         return columns, rows[: node.count]
     raise ValidationError(f"cannot execute node: {type(node).__name__}")
+
+
+def _column_lookup(column: Column, row: dict[str, object]) -> object:
+    """Tolerant column read: qualified key first, bare name as fallback, None when absent."""
+    if column.table:
+        qualified = f"{column.table}.{column.name}"
+        if qualified in row:
+            return row[qualified]
+    return row.get(column.name)
 
 
 def _aggregate_argument(function: Aggregate) -> str:
@@ -230,6 +307,8 @@ def _aggregate_input(function: Aggregate, row: dict[str, object]) -> object:
         return 1
     if isinstance(function.argument, Literal):
         return function.argument.value
+    if isinstance(function.argument, Column):
+        return _column_lookup(function.argument, row)
     return row.get(getattr(function.argument, "name", ""))
 
 

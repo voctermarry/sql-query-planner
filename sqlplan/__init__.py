@@ -9,6 +9,7 @@ from .parser import (
     Comparison,
     InList,
     IsNull,
+    Join,
     Literal,
     Not,
     OrderKey,
@@ -25,6 +26,7 @@ __all__ = [
     "Comparison",
     "InList",
     "IsNull",
+    "Join",
     "Literal",
     "Not",
     "OrderKey",
@@ -41,4 +43,4 @@ __all__ = [
     "tokenise",
 ]
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"

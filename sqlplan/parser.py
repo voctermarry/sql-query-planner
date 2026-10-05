@@ -2,8 +2,9 @@
 
 Grammar (everything is optional except SELECT ... FROM ...):
 
-    select   := SELECT projections FROM table [WHERE cond]
+    select   := SELECT projections FROM table [join]* [WHERE cond]
                 [GROUP BY column (',' column)*] [ORDER BY column [ASC|DESC]] [LIMIT number] [';']
+    join     := INNER JOIN table ON cond
     proj     := expr [AS identifier] | '*'
     expr     := aggregate '(' (column | '*') ')' | column | literal
     cond     := or_expr
@@ -91,9 +92,16 @@ class Projection:
 
 
 @dataclass(frozen=True, slots=True)
+class Join:
+    table: str
+    condition: object
+
+
+@dataclass(frozen=True, slots=True)
 class Select:
     projections: tuple[Projection, ...]
     table: str
+    joins: tuple[Join, ...] = ()
     where: object | None = None
     group_by: tuple[Column, ...] = ()
     order_by: tuple[OrderKey, ...] = ()
@@ -104,6 +112,8 @@ class Select:
             "projections": [_projection(item) for item in self.projections],
             "table": self.table,
         }
+        if self.joins:
+            document["joins"] = [{"table": join.table, "on": _expression(join.condition)} for join in self.joins]
         if self.where is not None:
             document["where"] = _expression(self.where)
         if self.group_by:
@@ -198,6 +208,12 @@ class Parser:
         projections = self.parse_projections()
         self.expect_keyword("from")
         table = self.expect_identifier()
+        joins: list[Join] = []
+        while self.eat_keyword("inner"):
+            self.expect_keyword("join")
+            join_table = self.expect_identifier()
+            self.expect_keyword("on")
+            joins.append(Join(table=join_table, condition=self.parse_condition()))
         where = None
         group_by: tuple[Column, ...] = ()
         order_by: tuple[OrderKey, ...] = ()
@@ -220,6 +236,7 @@ class Parser:
         return Select(
             projections=projections,
             table=table,
+            joins=tuple(joins),
             where=where,
             group_by=group_by,
             order_by=order_by,
