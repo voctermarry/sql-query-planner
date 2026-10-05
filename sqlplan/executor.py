@@ -215,18 +215,7 @@ def _execute(
                 else:
                     record[_projection_label(projection)] = evaluate(expression, row)
             output.append(record)
-        if node.qualified:
-            # Above a join a bare star expands to the actual "table.column" output columns; an aliased
-            # star is impossible in this subset so every projection is a real label.
-            header = [
-                _projection_label(projection)
-                for projection in node.projections
-                if not isinstance(projection.expression, Star)
-            ]
-            if any(isinstance(projection.expression, Star) for projection in node.projections):
-                header = _ordered_star_keys(node.projections, rows) + header
-            return header, output, None
-        return [_projection_label(projection) for projection in node.projections], output, None
+        return _project_header(node.projections, columns), output, None
     if isinstance(node, PhysicalSort):
         columns, rows, _ = _execute(node.input, tables)
 
@@ -246,23 +235,21 @@ def _execute(
     raise ValidationError(f"cannot execute node: {type(node).__name__}")
 
 
-def _ordered_star_keys(projections: tuple[Projection, ...], rows: list[dict[str, object]]) -> list[str]:
-    """Order of a SELECT * above a join.
+def _project_header(projections: tuple[Projection, ...], input_columns: list[str]) -> list[str]:
+    """The output column list of a projection, known before any row is seen.
 
-    Join output rows are already built in (left scan columns, then right scan columns) order, so the
-    first row carries the canonical column order. Falling back to first-appearance keeps this safe if
-    the join produced zero rows.
+    A star expands to the input's columns at its position in the SELECT list: the scan's columns for
+    one table, the join's qualified "table.column" columns above a join. Explicit projections keep
+    their labels. Because a JSON object keeps one key per name, the header keeps the first occurrence
+    of each name and never contains a literal "*".
     """
-    if not any(isinstance(item.expression, Star) for item in projections):
-        return []
-    if rows:
-        return list(rows[0].keys())
-    names: list[str] = []
-    for row in rows:
-        for name in row:
-            if name not in names:
-                names.append(name)
-    return names
+    header: list[str] = []
+    for projection in projections:
+        names = input_columns if isinstance(projection.expression, Star) else [_projection_label(projection)]
+        for name in names:
+            if name not in header:
+                header.append(name)
+    return header
 
 
 def _merged_row(
@@ -285,6 +272,7 @@ def _execute_join(node: object, tables: dict[str, Table]) -> tuple[list[str], li
     if isinstance(node, HashJoin):
         left_columns, left_rows, left_positions = _execute(node.left, tables)
         right_columns, right_rows, right_positions = _execute(node.right, tables)
+        join_columns = [left_columns, right_columns]
         pairs: list[tuple[int, int, dict[str, object]]] = []
         if node.build_side == "right":
             index = _hash_by_key(right_rows, right_positions, node.right_key)
@@ -301,19 +289,21 @@ def _execute_join(node: object, tables: dict[str, Table]) -> tuple[list[str], li
         inner_table = tables[node.inner_table]
         index = inner_table.index_for(node.inner_index_column)
         if node.outer_side == "left":
+            join_columns = [outer_columns, list(node.inner_columns)]
             pairs = _inlj_pairs(node, outer_rows, outer_positions or [], outer_columns, inner_table, index, left_outer=True)
         else:
+            join_columns = [list(node.inner_columns), outer_columns]
             pairs = _inlj_pairs(node, outer_rows, outer_positions or [], outer_columns, inner_table, index, left_outer=False)
     else:  # pragma: no cover - guarded by caller
         raise ValidationError(f"cannot execute join node: {type(node).__name__}")
 
-    # One canonical order regardless of algorithm: logical left original order, then right.
+    # One canonical order regardless of algorithm: logical left original order, then right. The
+    # column list comes from the inputs' schemas, not from emitted pairs, so an empty join still
+    # reports every qualified "table.column" it would have produced.
     pairs.sort(key=lambda item: (item[0], item[1]))
-    columns: list[str] = []
-    for _, _, row in pairs:
-        for name in row:
-            if name not in columns:
-                columns.append(name)
+    columns = [f"{node.left_table}.{column}" for column in join_columns[0]] + [
+        f"{node.right_table}.{column}" for column in join_columns[1]
+    ]
     return columns, [row for _, _, row in pairs]
 
 
