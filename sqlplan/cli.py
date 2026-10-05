@@ -157,6 +157,23 @@ def _index_specs(statement: Any, raw: Sequence[str], table_names: Sequence[str])
     return specs
 
 
+def _distinct_count(values: Any) -> int:
+    """Distinct count for a column's values.
+
+    JSON arrays and objects are unhashable, so a plain set raises TypeError while statistics are
+    being gathered -- before the executor can reject them as an invalid min/max input. Count those
+    pairwise instead (equality, never hashing), which gives the same answer on ordinary values.
+    """
+    try:
+        return len(set(values))
+    except TypeError:
+        seen: list[object] = []
+        for value in values:
+            if value not in seen:
+                seen.append(value)
+        return len(seen)
+
+
 def _catalog_and_tables(
     bindings: Sequence[tuple[str, str]], indexes: dict[str, list[str]]
 ) -> tuple[Catalog, dict[str, Table]]:
@@ -169,7 +186,7 @@ def _catalog_and_tables(
             for column in row:
                 if column not in columns:
                     columns.append(column)
-        distinct = {column: len({row.get(column) for row in rows}) for column in columns}
+        distinct = {column: _distinct_count(row.get(column) for row in rows) for column in columns}
         catalog.add(
             TableInfo(
                 name=name,

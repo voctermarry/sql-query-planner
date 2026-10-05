@@ -112,7 +112,77 @@ def _truthy(value: object) -> bool:
     return value is True
 
 
-def aggregate_value(function: str, values: list[object], distinct: bool) -> object:
+def _is_json_number(value: object) -> bool:
+    # bool is a subclass of int; a Boolean is never a number for min/max.
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def _extreme(function: str, present: list[object], column: str) -> object:
+    """min/max over one group's non-NULL values.
+
+    All numbers or all strings only; a mix, or a Boolean/array/object, is a validation error. Numeric
+    comparison is by value (int and decimal may mix), but the chosen row keeps its original Python
+    value so an integer extremum stays an integer in the JSON. Numeric ties keep input order; strings
+    compare in the same order ORDER BY uses.
+    """
+    numeric = [_is_json_number(value) for value in present]
+    if all(numeric):
+        # Direct int/float comparison: precise for mixed types and immune to float() overflow on
+        # huge integers. Strict ordering means a numerical tie (3 == 3.0) keeps the earlier value.
+        chosen = present[0]
+        for value in present[1:]:
+            better = value < chosen if function == "min" else value > chosen
+            if better:
+                chosen = value
+        return chosen
+    if all(isinstance(value, str) for value in present):
+        chosen = present[0]
+        for value in present[1:]:
+            if function == "min":
+                better = _Ascending(value) < _Ascending(chosen)
+            else:
+                better = _Descending(value) < _Descending(chosen)
+            if better:
+                chosen = value
+        return chosen
+    kinds = sorted({_value_kind(value) for value in present})
+    raise ValidationError(
+        f"{function}({column}): values must be all numbers or all strings, got {', '.join(kinds)}",
+        column=column,
+        types=kinds,
+    )
+
+
+def _value_kind(value: object) -> str:
+    if isinstance(value, bool):
+        return "boolean"
+    if isinstance(value, str):
+        return "string"
+    if isinstance(value, (int, float)):
+        return "number"
+    if isinstance(value, list):
+        return "array"
+    if isinstance(value, dict):
+        return "object"
+    return type(value).__name__
+
+
+def _as_number(value: object, function: str, column: str) -> float:
+    """Numeric conversion for sum/avg.
+
+    Booleans keep their pre-existing numeric behaviour here (only min/max reject them); a string,
+    array or object is unsupported and reported as a validation error instead of leaking the
+    ValueError/TypeError that float() would raise.
+    """
+    if isinstance(value, (int, float)):
+        return float(value)
+    raise ValidationError(
+        f"{function}({column}): expected a number, got {_value_kind(value)}",
+        column=column,
+    )
+
+
+def aggregate_value(function: str, values: list[object], distinct: bool, column: str = "?") -> object:
     if distinct:
         seen: list[object] = []
         for value in values:
@@ -124,13 +194,11 @@ def aggregate_value(function: str, values: list[object], distinct: bool) -> obje
         return len(present)
     if not present:
         return None
-    numbers = [float(value) for value in present]  # type: ignore[arg-type]
+    if function in ("min", "max"):
+        return _extreme(function, present, column)
+    numbers = [_as_number(value, function, column) for value in present]
     if function == "sum":
         return sum(numbers)
-    if function == "min":
-        return min(numbers)
-    if function == "max":
-        return max(numbers)
     if function == "avg":
         return sum(numbers) / len(numbers)
     raise ValidationError(f"unknown aggregate: {function}")
@@ -196,9 +264,15 @@ def _execute(
             members = groups[key]
             labels = node.group_labels or group_keys
             record: dict[str, object] = {name: value for name, value in zip(labels, key)}
-            for function in node.aggregates:
+            # Validate min/max before sum/avg: an unsupported extremum input must surface as its own
+            # validation error even when the SELECT list writes sum/avg first. Header order is fixed
+            # by `names` above, so evaluating extrema first changes nothing in the output columns.
+            ordered = sorted(node.aggregates, key=lambda function: function.function not in ("min", "max"))
+            for function in ordered:
                 values = [_aggregate_input(function, member) for member in members]
-                record[_aggregate_label(function)] = aggregate_value(function.function, values, function.distinct)
+                record[_aggregate_label(function)] = aggregate_value(
+                    function.function, values, function.distinct, _aggregate_argument(function)
+                )
             output.append(record)
         return names, output, None
     if isinstance(node, PhysicalProject):
