@@ -2,7 +2,8 @@
 
 Grammar (everything is optional except SELECT ... FROM ...):
 
-    select   := SELECT projections FROM table [WHERE cond]
+    select   := SELECT projections FROM table
+                [INNER JOIN table ON cond] [WHERE cond]
                 [GROUP BY column (',' column)*] [ORDER BY column [ASC|DESC]] [LIMIT number] [';']
     proj     := expr [AS identifier] | '*'
     expr     := aggregate '(' (column | '*') ')' | column | literal
@@ -91,6 +92,14 @@ class Projection:
 
 
 @dataclass(frozen=True, slots=True)
+class JoinClause:
+    """One INNER JOIN: the right-hand table and its ON predicate (equality once planned)."""
+
+    table: str
+    on: object
+
+
+@dataclass(frozen=True, slots=True)
 class Select:
     projections: tuple[Projection, ...]
     table: str
@@ -98,18 +107,31 @@ class Select:
     group_by: tuple[Column, ...] = ()
     order_by: tuple[OrderKey, ...] = ()
     limit: int | None = None
+    joins: tuple[JoinClause, ...] = ()
 
     def to_document(self) -> dict[str, object]:
         document: dict[str, object] = {
             "projections": [_projection(item) for item in self.projections],
             "table": self.table,
         }
+        if self.joins:
+            document["joins"] = [
+                {"type": "inner", "table": join.table, "on": _expression(join.on)} for join in self.joins
+            ]
         if self.where is not None:
             document["where"] = _expression(self.where)
         if self.group_by:
-            document["groupBy"] = [item.name for item in self.group_by]
+            document["groupBy"] = [
+                item.name if item.table is None else {"name": item.name, "table": item.table}
+                for item in self.group_by
+            ]
         if self.order_by:
-            document["orderBy"] = [{"column": key.column.name, "descending": key.descending} for key in self.order_by]
+            document["orderBy"] = [
+                {"column": key.column.name, "table": key.column.table, "descending": key.descending}
+                if key.column.table is not None
+                else {"column": key.column.name, "descending": key.descending}
+                for key in self.order_by
+            ]
         if self.limit is not None:
             document["limit"] = self.limit
         return document
@@ -198,6 +220,7 @@ class Parser:
         projections = self.parse_projections()
         self.expect_keyword("from")
         table = self.expect_identifier()
+        joins = tuple(self.parse_joins())
         where = None
         group_by: tuple[Column, ...] = ()
         order_by: tuple[OrderKey, ...] = ()
@@ -224,7 +247,18 @@ class Parser:
             group_by=group_by,
             order_by=order_by,
             limit=limit,
+            joins=joins,
         )
+
+    def parse_joins(self) -> list[JoinClause]:
+        joins: list[JoinClause] = []
+        while self.eat_keyword("inner"):
+            self.expect_keyword("join")
+            right = self.expect_identifier()
+            self.expect_keyword("on")
+            on = self.parse_condition()
+            joins.append(JoinClause(table=right, on=on))
+        return joins
 
     def parse_projections(self) -> tuple[Projection, ...]:
         items = [self.parse_projection()]

@@ -27,6 +27,9 @@ KEYWORDS = (
     "null",
     "in",
     "as",
+    "inner",
+    "join",
+    "on",
     # 'distinct' must be a keyword: without it `count(DISTINCT a)` lexed DISTINCT as a column name and
     # the parser then demanded ')' while 'a' was still unconsumed (caught by test_count_distinct).
     "distinct",

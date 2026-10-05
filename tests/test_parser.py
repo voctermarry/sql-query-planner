@@ -122,6 +122,50 @@ class ParserTests(unittest.TestCase):
         with self.assertRaises(ParseError):
             parse("SELECT sum(*) FROM t")
 
+    def test_inner_join_is_parsed(self) -> None:
+        statement = parse("SELECT a FROM l INNER JOIN r ON l.k = r.k")
+        self.assertEqual(len(statement.joins), 1)
+        join = statement.joins[0]
+        self.assertEqual(join.table, "r")
+        self.assertEqual(join.on, Comparison(Column("k", "l"), "=", Column("k", "r")))
+
+    def test_join_mixes_with_other_clauses(self) -> None:
+        statement = parse(
+            "SELECT a FROM l INNER JOIN r ON l.k = r.k WHERE a = 1 GROUP BY a ORDER BY a DESC LIMIT 2"
+        )
+        self.assertEqual(statement.joins[0].table, "r")
+        self.assertIsNotNone(statement.where)
+        self.assertEqual(statement.group_by, (Column("a"),))
+        self.assertTrue(statement.order_by[0].descending)
+        self.assertEqual(statement.limit, 2)
+
+    def test_join_document_carries_the_on_predicate(self) -> None:
+        document = parse("SELECT a FROM l INNER JOIN r ON l.k = r.k").to_document()
+        self.assertEqual(document["table"], "l")
+        self.assertEqual(document["joins"], [{"type": "inner", "table": "r", "on": {
+            "kind": "comparison",
+            "operator": "=",
+            "left": {"kind": "column", "name": "k", "table": "l"},
+            "right": {"kind": "column", "name": "k", "table": "r"},
+        }}])
+
+    def test_two_joins_parse_so_the_planner_can_reject_them(self) -> None:
+        statement = parse("SELECT a FROM l INNER JOIN r ON l.k = r.k INNER JOIN s ON r.k = s.k")
+        self.assertEqual([join.table for join in statement.joins], ["r", "s"])
+
+    def test_missing_on_is_a_parse_error_with_a_position(self) -> None:
+        with self.assertRaises(ParseError) as caught:
+            parse("SELECT a FROM l INNER JOIN r l.k = r.k")
+        self.assertEqual(caught.exception.kind, "parse_error")
+        self.assertIsNotNone(caught.exception.context["column"])
+
+    def test_truncated_on_is_a_parse_error_with_a_position(self) -> None:
+        with self.assertRaises(ParseError) as caught:
+            parse("SELECT a FROM l INNER JOIN r ON")
+        self.assertEqual(caught.exception.kind, "parse_error")
+        self.assertIsNotNone(caught.exception.context["line"])
+        self.assertIsNotNone(caught.exception.context["column"])
+
 
 if __name__ == "__main__":
     unittest.main()

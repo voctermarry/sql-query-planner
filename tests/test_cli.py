@@ -137,5 +137,102 @@ class CLITests(unittest.TestCase):
         self.assertEqual(document["line"], 2)
 
 
+class JoinCLITests(unittest.TestCase):
+    JOIN_SQL = "SELECT orders.id, customers.name FROM orders INNER JOIN customers ON orders.cid = customers.cid"
+
+    def setUp(self) -> None:
+        self.directory = tempfile.TemporaryDirectory()
+        self.orders = os.path.join(self.directory.name, "orders.jsonl")
+        self.customers = os.path.join(self.directory.name, "customers.jsonl")
+        with open(self.orders, "w", encoding="utf-8", newline="\n") as handle:
+            for index in range(1, 61):
+                handle.write(json.dumps({"id": index, "cid": (index % 3) + 1, "amount": float(index)}) + "\n")
+        with open(self.customers, "w", encoding="utf-8", newline="\n") as handle:
+            for cid in (1, 2, 3):
+                handle.write(json.dumps({"cid": cid, "name": f"n{cid}"}) + "\n")
+
+    def tearDown(self) -> None:
+        self.directory.cleanup()
+
+    def bindings(self) -> list[str]:
+        return ["--table", f"orders={self.orders}", "--table", f"customers={self.customers}"]
+
+    def test_plan_accepts_repeated_table_bindings(self) -> None:
+        code, out, err = run_cli(["plan", "--sql", self.JOIN_SQL, *self.bindings()])
+        self.assertEqual((code, err), (EXIT_OK, ""))
+        document = json.loads(out)
+        self.assertEqual(document["tables"], ["orders", "customers"])
+        self.assertEqual(document["physical"]["input"]["leftTable"], "orders")
+        self.assertEqual(document["physical"]["input"]["rightTable"], "customers")
+        self.assertEqual(document["physical"]["input"]["leftKey"], "cid")
+
+    def test_explain_tree_has_two_inputs(self) -> None:
+        code, out, _ = run_cli(["explain", "--sql", self.JOIN_SQL, *self.bindings()])
+        self.assertEqual(code, EXIT_OK)
+        tree = json.loads(out)["tree"]
+        self.assertTrue(any(line.strip().startswith("hash-join") for line in tree))
+        self.assertEqual(sum(1 for line in tree if "full-scan" in line), 2)
+
+    def test_qualified_index_flips_the_join_operator(self) -> None:
+        # customers is small so hash wins unless orders is the tiny outer; use the reverse shape instead:
+        sql = "SELECT customers.name, orders.id FROM customers INNER JOIN orders ON customers.cid = orders.cid"
+        code, out, _ = run_cli(
+            ["explain", "--sql", sql, *self.bindings(), "--index", "orders.cid"]
+        )
+        self.assertEqual(code, EXIT_OK)
+        self.assertEqual(json.loads(out)["physical"]["input"]["operator"], "index-nested-loop-join")
+
+    def test_run_joins_and_writes_rows(self) -> None:
+        code, out, err = run_cli(["run", "--sql", self.JOIN_SQL + " ORDER BY orders.id LIMIT 3", *self.bindings()])
+        self.assertEqual((code, err), (EXIT_OK, ""))
+        document = json.loads(out)
+        self.assertEqual(document["columns"], ["id", "name"])
+        self.assertEqual(len(document["rows"]), 3)
+
+    def test_reconcile_reports_both_join_operators_and_orders(self) -> None:
+        sql = "SELECT customers.name, orders.id FROM customers INNER JOIN orders ON customers.cid = orders.cid"
+        code, out, _ = run_cli(["reconcile", "--sql", sql, *self.bindings(), "--index", "orders.cid"])
+        self.assertEqual(code, EXIT_OK)
+        document = json.loads(out)
+        self.assertTrue(document["identical"])
+        first, second = document["plans"]
+        self.assertEqual(first["joinOperator"], "index-nested-loop-join")
+        self.assertEqual(first["joinOrder"], ["customers", "orders"])
+        self.assertEqual(second["joinOperator"], "hash-join")
+        self.assertIn("orders", second["joinOrder"])
+
+    def test_missing_binding_is_a_validation_error(self) -> None:
+        code, _, err = run_cli(["plan", "--sql", self.JOIN_SQL, "--table", f"orders={self.orders}"])
+        self.assertEqual(code, EXIT_ERROR)
+        document = json.loads(err)
+        self.assertEqual(document["error"], "validation_error")
+        self.assertEqual(document["tables"], ["customers"])
+
+    def test_duplicate_binding_is_a_validation_error(self) -> None:
+        code, _, err = run_cli(
+            ["plan", "--sql", self.JOIN_SQL, "--table", f"orders={self.orders}", "--table", f"orders={self.orders}"]
+        )
+        self.assertEqual(code, EXIT_ERROR)
+        self.assertEqual(json.loads(err)["error"], "validation_error")
+
+    def test_malformed_binding_is_a_validation_error(self) -> None:
+        code, _, err = run_cli(
+            ["plan", "--sql", self.JOIN_SQL, "--table", "orders", "--table", f"customers={self.customers}"]
+        )
+        self.assertEqual(code, EXIT_ERROR)
+        self.assertEqual(json.loads(err)["error"], "validation_error")
+
+    def test_unqualified_index_on_a_join_is_rejected(self) -> None:
+        code, _, err = run_cli(["plan", "--sql", self.JOIN_SQL, *self.bindings(), "--index", "cid"])
+        self.assertEqual(code, EXIT_ERROR)
+        self.assertEqual(json.loads(err)["error"], "validation_error")
+
+    def test_output_colliding_with_either_input_is_rejected_before_reading(self) -> None:
+        for colliding in (self.orders, self.customers):
+            code, _, err = run_cli(["run", "--sql", self.JOIN_SQL, *self.bindings(), "--output", colliding])
+            self.assertEqual(code, EXIT_ERROR)
+            self.assertEqual(json.loads(err)["error"], "output_error")
+
+
 if __name__ == "__main__":
     unittest.main()

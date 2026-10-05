@@ -6,12 +6,15 @@ Subcommands (stdout is JSON only; errors are one JSON document on stderr):
   parse      -- the AST of one statement
   plan       -- logical and physical plan with estimates and the rewrites that were applied
   explain    -- the same plan plus an indented operator tree for humans
-  run        -- execute the statement against a JSONL table
+  run        -- execute the statement against one or two JSONL tables
   reconcile  -- execute the statement through two different physical plans and compare the results
 
-Exit codes are part of the contract: 0 success, 2 input/usage error, 3 a report was produced whose
-verdict is negative (no rows, or two plans disagreed). `run` and `reconcile` write output atomically,
-and an output path that collides with an input is rejected before anything is read.
+Table bindings are repeatable: ``--table orders=orders.jsonl``; a bare ``--table orders.jsonl`` keeps
+the single-table form working. Indexes follow the same split: ``--index orders.cid`` for a join, a
+bare ``--index region`` for one table. Exit codes are part of the contract: 0 success, 2 input/usage
+error, 3 a report was produced whose verdict is negative (no rows, or two plans disagreed). `run` and
+`reconcile` write output atomically, and an output path that collides with any input is rejected
+before anything is read.
 """
 
 from __future__ import annotations
@@ -30,8 +33,8 @@ from .parser import parse
 from .planner import (
     EXTENSION_SURFACE,
     Catalog,
-    FullScan,
-    IndexScan,
+    HashJoin,
+    IndexNestedLoopJoin,
     TableInfo,
     describe_node,
     explain,
@@ -104,56 +107,92 @@ def _load_rows(path: str) -> list[dict[str, Any]]:
     return rows
 
 
-def _catalog_for(name: str, rows: list[dict[str, Any]], indexes: Sequence[str]) -> Catalog:
-    columns: list[str] = []
-    for row in rows:
-        for column in row:
-            if column not in columns:
-                columns.append(column)
-    distinct: dict[str, int] = {}
-    for column in columns:
-        distinct[column] = len({row.get(column) for row in rows})
+def _table_bindings(statement: Any, values: Sequence[str]) -> list[tuple[str, str]]:
+    """Resolve repeatable --table values to (name, path) pairs in FROM order.
+
+    A one-table query keeps the baseline contract verbatim: the single value is a path and is never
+    split (so a path that happens to contain '=' still opens). Only a join switches to the
+    repeatable ``name=path`` form, in which every binding must be well-formed.
+    """
+    required = [statement.table, *(join.table for join in statement.joins)]
+    if len(required) == 1:
+        if len(values) != 1:
+            raise ValidationError("a one-table query takes exactly one --table path")
+        return [(required[0], values[0])]
+
+    bindings: dict[str, str] = {}
+    for value in values:
+        if "=" not in value:
+            raise ValidationError(f"malformed table binding: {value!r} (need 'name=path')", value=value)
+        name, path = value.split("=", 1)
+        name, path = name.strip(), path.strip()
+        if not name or not path:
+            raise ValidationError(f"malformed table binding: {value!r} (need 'name=path')", value=value)
+        if name in bindings:
+            raise ValidationError(f"duplicate table binding: {name}", table=name)
+        if name not in required:
+            raise ValidationError(f"table binding is not used by the query: {name}", table=name, known=required)
+        bindings[name] = path
+    missing = [name for name in required if name not in bindings]
+    if missing:
+        raise ValidationError("missing table binding", tables=missing)
+    return [(name, bindings[name]) for name in required]
+
+
+def _index_specs(statement: Any, raw: Sequence[str], table_names: Sequence[str]) -> dict[str, list[str]]:
+    specs: dict[str, list[str]] = {name: [] for name in table_names}
+    for value in raw:
+        if "." in value:
+            table, column = value.split(".", 1)
+            if not table or not column:
+                raise ValidationError(f"malformed index declaration: {value!r} (need 'table.column')", value=value)
+            if table not in specs:
+                raise ValidationError(f"index on unknown table: {table}", table=table, known=list(table_names))
+        else:
+            if len(table_names) != 1:
+                raise ValidationError("join indexes must be qualified as 'table.column'", value=value)
+            table, column = table_names[0], value
+        if column not in specs[table]:
+            specs[table].append(column)
+    return specs
+
+
+def _catalog_and_tables(
+    bindings: Sequence[tuple[str, str]], indexes: dict[str, list[str]]
+) -> tuple[Catalog, dict[str, Table]]:
     catalog = Catalog()
-    catalog.add(TableInfo(name=name, columns=tuple(sorted(columns)), rows=len(rows), distinct=distinct, indexes=tuple(indexes)))
-    return catalog
+    tables: dict[str, Table] = {}
+    for name, path in bindings:
+        rows = _load_rows(path)
+        columns: list[str] = []
+        for row in rows:
+            for column in row:
+                if column not in columns:
+                    columns.append(column)
+        distinct = {column: len({row.get(column) for row in rows}) for column in columns}
+        catalog.add(
+            TableInfo(
+                name=name,
+                columns=tuple(sorted(columns)),
+                rows=len(rows),
+                distinct=distinct,
+                indexes=tuple(indexes.get(name, [])),
+            )
+        )
+        tables[name] = Table(name=name, columns=tuple(sorted(columns)), rows=[dict(row) for row in rows])
+    return catalog, tables
 
 
-def _table_for(name: str, rows: list[dict[str, Any]]) -> Table:
-    columns: list[str] = []
-    for row in rows:
-        for column in row:
-            if column not in columns:
-                columns.append(column)
-    return Table(name=name, columns=tuple(sorted(columns)), rows=[dict(row) for row in rows])
-
-
-def _plan_for(args: argparse.Namespace) -> tuple[Any, Catalog, Table]:
+def _prepare(args: argparse.Namespace, *, with_index: bool = True) -> tuple[Any, Catalog, dict[str, Table], list[str]]:
     statement = parse(args.sql)
-    rows = _load_rows(args.table)
-    catalog = _catalog_for(statement.table, rows, args.index or [])
-    return plan(statement, catalog), catalog, _table_for(statement.table, rows)
-
-
-def _tree(node: object, depth: int = 0) -> list[str]:
-    document = describe_node(node)
-    operator = str(document["operator"])
-    detail = {key: value for key, value in document.items() if key not in ("operator", "input")}
-    line = f"{'  ' * depth}{operator} {canonical(detail) if detail else ''}".rstrip()
-    lines = [line]
-    child = document.get("input")
-    if isinstance(child, dict):
-        lines.extend(_tree_from_document(child, depth + 1))
-    return lines
-
-
-def _tree_from_document(document: dict[str, Any], depth: int) -> list[str]:
-    operator = str(document["operator"])
-    detail = {key: value for key, value in document.items() if key not in ("operator", "input")}
-    lines = [f"{'  ' * depth}{operator} {canonical(detail) if detail else ''}".rstrip()]
-    child = document.get("input")
-    if isinstance(child, dict):
-        lines.extend(_tree_from_document(child, depth + 1))
-    return lines
+    bindings = _table_bindings(statement, args.table or [])
+    input_paths = [path for _, path in bindings]
+    _assert_distinct(input_paths, getattr(args, "output", None))
+    raw_indexes = args.index or []
+    table_names = [name for name, _ in bindings]
+    indexes = _index_specs(statement, raw_indexes if with_index else [], table_names) if with_index else {}
+    catalog, tables = _catalog_and_tables(bindings, indexes)
+    return statement, catalog, tables, input_paths
 
 
 # -- commands ------------------------------------------------------------------------------------
@@ -164,8 +203,18 @@ def _command_describe(_: argparse.Namespace) -> int:
             "version": __version__,
             "subcommands": ["describe", "explain", "parse", "plan", "reconcile", "run"],
             "aggregates": ["avg", "count", "max", "min", "sum"],
-            "operators": ["filter", "full-scan", "index-scan", "limit", "project", "sort", "aggregate"],
-            "statistics": "from the table itself: row count and per-column distinct counts; --index declares an index",
+            "operators": [
+                "filter",
+                "full-scan",
+                "hash-join",
+                "index-nested-loop-join",
+                "index-scan",
+                "limit",
+                "project",
+                "sort",
+                "aggregate",
+            ],
+            "statistics": "from the tables themselves: row count and per-column distinct counts; --index declares an index",
             "exitCodes": {"ok": EXIT_OK, "error": EXIT_ERROR, "negativeVerdict": EXIT_NEGATIVE},
             "extensionSurface": list(EXTENSION_SURFACE),
         }
@@ -179,13 +228,15 @@ def _command_parse(args: argparse.Namespace) -> int:
 
 
 def _command_plan(args: argparse.Namespace) -> int:
-    result, _, _ = _plan_for(args)
+    _, catalog, tables, _ = _prepare(args)
+    result = plan(parse(args.sql), catalog)
     _emit(result.to_document())
     return EXIT_OK
 
 
 def _command_explain(args: argparse.Namespace) -> int:
-    result, _, _ = _plan_for(args)
+    _, catalog, _, _ = _prepare(args)
+    result = plan(parse(args.sql), catalog)
     document = explain(result)
     document["tree"] = _tree(result.physical)
     _emit(document)
@@ -193,58 +244,81 @@ def _command_explain(args: argparse.Namespace) -> int:
 
 
 def _command_run(args: argparse.Namespace) -> int:
-    _assert_distinct([args.table], args.output)
-    result, _, table = _plan_for(args)
-    columns, rows = execute(result.physical, table)
+    statement, catalog, tables, _ = _prepare(args)
+    result = plan(statement, catalog)
+    columns, rows = execute(result.physical, tables)
     _write(args.output, [canonical({"columns": columns, "rows": rows, "plan": describe_node(result.physical)["operator"]})])
     return EXIT_OK if rows else EXIT_NEGATIVE
 
 
+def _join_summary(node: object) -> tuple[str | None, list[str] | None]:
+    """The join operator a plan uses and its join order, or (None, None) for a single table."""
+    found = _first_join(node)
+    if found is None:
+        return None, None
+    document = describe_node(found)
+    return str(document["operator"]), list(document.get("joinOrder", []))
+
+
+def _first_join(node: object) -> object:
+    if isinstance(node, (HashJoin, IndexNestedLoopJoin)):
+        return node
+    for attribute in ("input", "left", "right", "outer"):
+        child = getattr(node, attribute, None)
+        if child is not None and hasattr(child, "__dataclass_fields__"):
+            found = _first_join(child)
+            if found is not None:
+                return found
+    return None
+
+
 def _scan_operator(node: object) -> str:
-    """The access path actually chosen, found by walking to the bottom of the tree.
+    """The access path actually chosen: the first leaf scan walking the plan.
 
     Reporting only the root operator made `reconcile` useless: every plan ends in `project`, so two
     plans with different access paths looked identical in the report (the test caught exactly that).
+    A join descends through its left/outer input to that input's scan; the join itself is reported
+    separately as `joinOperator`.
     """
-    document = describe_node(node)
-    child = document.get("input")
-    while isinstance(child, dict):
-        document = child
-        child = document.get("input")
-    return str(document["operator"])
+    for attribute in ("input", "left", "outer", "right"):
+        child = getattr(node, attribute, None)
+        if child is not None and hasattr(child, "__dataclass_fields__"):
+            return _scan_operator(child)
+    return str(describe_node(node)["operator"])
+
+
+def _plan_entry(label: str, chosen: object) -> dict[str, Any]:
+    join_operator, join_order = _join_summary(chosen.physical)
+    return {
+        "catalog": label,
+        "estimatedCost": round(chosen.estimated_cost, 3),
+        "root": describe_node(chosen.physical)["operator"],
+        "accessPath": _scan_operator(chosen.physical),
+        "joinOperator": join_operator,
+        "joinOrder": join_order,
+    }
 
 
 def _command_reconcile(args: argparse.Namespace) -> int:
-    _assert_distinct([args.table], args.output)
     statement = parse(args.sql)
-    all_rows = _load_rows(args.table)
-    indexed = _catalog_for(statement.table, all_rows, args.index or [])
-    plain = _catalog_for(statement.table, all_rows, [])
-    table = _table_for(statement.table, all_rows)
+    bindings = _table_bindings(statement, args.table or [])
+    _assert_distinct([path for _, path in bindings], args.output)
+    table_names = [name for name, _ in bindings]
+    indexed_specs = _index_specs(statement, args.index or [], table_names)
 
-    chosen = plan(statement, indexed)
-    baseline = plan(statement, plain)
-    first = execute(chosen.physical, table)
-    second = execute(baseline.physical, table)
+    indexed_catalog, tables = _catalog_and_tables(bindings, indexed_specs)
+    plain_catalog, _ = _catalog_and_tables(bindings, {})
+
+    chosen = plan(statement, indexed_catalog)
+    baseline = plan(statement, plain_catalog)
+    first = execute(chosen.physical, tables)
+    second = execute(baseline.physical, tables)
     identical = first == second
     report = {
         "sql": args.sql,
         "rows": len(first[1]),
         "identical": identical,
-        "plans": [
-            {
-                "catalog": "with-index",
-                "estimatedCost": round(chosen.estimated_cost, 3),
-                "root": describe_node(chosen.physical)["operator"],
-                "accessPath": _scan_operator(chosen.physical),
-            },
-            {
-                "catalog": "without-index",
-                "estimatedCost": round(baseline.estimated_cost, 3),
-                "root": describe_node(baseline.physical)["operator"],
-                "accessPath": _scan_operator(baseline.physical),
-            },
-        ],
+        "plans": [_plan_entry("with-index", chosen), _plan_entry("without-index", baseline)],
     }
     if not identical:
         report["first"] = {"columns": first[0], "rows": first[1]}
@@ -253,11 +327,55 @@ def _command_reconcile(args: argparse.Namespace) -> int:
     return EXIT_OK if identical else EXIT_NEGATIVE
 
 
-def _add_query_arguments(parser: argparse.ArgumentParser, *, need_table: bool) -> None:
+def _tree_children(document: dict[str, Any]) -> list[dict[str, Any]]:
+    # Binary joins expose left/right; every other node is unary through input. outer/inner duplicate
+    # left/right on an index-nested-loop join, so they are deliberately not walked again.
+    if isinstance(document.get("left"), dict) and isinstance(document.get("right"), dict):
+        return [document["left"], document["right"]]
+    child = document.get("input")
+    return [child] if isinstance(child, dict) else []
+
+
+def _node_line(document: dict[str, Any], depth: int) -> str:
+    operator = str(document["operator"])
+    detail = {
+        key: value
+        for key, value in document.items()
+        if key not in ("operator", "input", "left", "right", "outer", "inner")
+    }
+    return f"{'  ' * depth}{operator} {canonical(detail) if detail else ''}".rstrip()
+
+
+def _tree(node: object, depth: int = 0) -> list[str]:
+    document = describe_node(node)
+    lines = [_node_line(document, depth)]
+    for child in _tree_children(document):
+        lines.extend(_tree_from_document(child, depth + 1))
+    return lines
+
+
+def _tree_from_document(document: dict[str, Any], depth: int) -> list[str]:
+    lines = [_node_line(document, depth)]
+    for child in _tree_children(document):
+        lines.extend(_tree_from_document(child, depth + 1))
+    return lines
+
+
+def _add_query_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--sql", required=True)
-    if need_table:
-        parser.add_argument("--table", required=True, help="JSONL rows, or - for stdin")
-        parser.add_argument("--index", action="append", default=[], help="column to declare an index on (repeatable)")
+    parser.add_argument(
+        "--table",
+        action="append",
+        default=[],
+        required=True,
+        help="JSONL rows as 'name=path' (repeatable); a bare path works for a one-table query; - is stdin",
+    )
+    parser.add_argument(
+        "--index",
+        action="append",
+        default=[],
+        help="index on 'table.column' (repeatable); a bare column works for a one-table query",
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -271,18 +389,18 @@ def build_parser() -> argparse.ArgumentParser:
     parse_command.add_argument("--sql", required=True)
     parse_command.set_defaults(handler=_command_parse)
 
-    for name, handler, needs_table in (("plan", _command_plan, True), ("explain", _command_explain, True)):
+    for name, handler in (("plan", _command_plan), ("explain", _command_explain)):
         command = subparsers.add_parser(name, help="print the plan" if name == "plan" else "print the plan and a tree")
-        _add_query_arguments(command, need_table=needs_table)
+        _add_query_arguments(command)
         command.set_defaults(handler=handler)
 
     run = subparsers.add_parser("run", help="execute the statement")
-    _add_query_arguments(run, need_table=True)
+    _add_query_arguments(run)
     run.add_argument("--output")
     run.set_defaults(handler=_command_run)
 
     reconcile = subparsers.add_parser("reconcile", help="execute through two plans and compare")
-    _add_query_arguments(reconcile, need_table=True)
+    _add_query_arguments(reconcile)
     reconcile.add_argument("--output")
     reconcile.set_defaults(handler=_command_reconcile)
     return parser
