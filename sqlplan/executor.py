@@ -144,8 +144,6 @@ def _projection_label(projection: Projection) -> str:
         return expression.name
     if isinstance(expression, Aggregate):
         return _aggregate_label(expression)
-    if isinstance(expression, Star):
-        return "*"
     return "expression"
 
 
@@ -215,18 +213,7 @@ def _execute(
                 else:
                     record[_projection_label(projection)] = evaluate(expression, row)
             output.append(record)
-        if node.qualified:
-            # Above a join a bare star expands to the actual "table.column" output columns; an aliased
-            # star is impossible in this subset so every projection is a real label.
-            header = [
-                _projection_label(projection)
-                for projection in node.projections
-                if not isinstance(projection.expression, Star)
-            ]
-            if any(isinstance(projection.expression, Star) for projection in node.projections):
-                header = _ordered_star_keys(node.projections, rows) + header
-            return header, output, None
-        return [_projection_label(projection) for projection in node.projections], output, None
+        return _project_header(node.projections, columns), output, None
     if isinstance(node, PhysicalSort):
         columns, rows, _ = _execute(node.input, tables)
 
@@ -246,23 +233,29 @@ def _execute(
     raise ValidationError(f"cannot execute node: {type(node).__name__}")
 
 
-def _ordered_star_keys(projections: tuple[Projection, ...], rows: list[dict[str, object]]) -> list[str]:
-    """Order of a SELECT * above a join.
+def _project_header(projections: tuple[Projection, ...], input_columns: list[str]) -> list[str]:
+    """Output column names, with each star expanded in place from the child's reported schema.
 
-    Join output rows are already built in (left scan columns, then right scan columns) order, so the
-    first row carries the canonical column order. Falling back to first-appearance keeps this safe if
-    the join produced zero rows.
+    The child reports its columns even when it produced no rows, so WHERE that filters everything,
+    LIMIT 0 and a join with no matches still name every output. A star is replaced at its SELECT
+    position (left table columns then right table columns above a join, already qualified); explicit
+    projections keep their existing labels. Names collide the same way JSON object keys do when a row
+    is built -- the first occurrence wins and later ones collapse -- so a name repeated between a
+    star and an explicit projection appears only once, in its first position.
     """
-    if not any(isinstance(item.expression, Star) for item in projections):
-        return []
-    if rows:
-        return list(rows[0].keys())
-    names: list[str] = []
-    for row in rows:
-        for name in row:
-            if name not in names:
-                names.append(name)
-    return names
+    header: list[str] = []
+
+    def add(name: str) -> None:
+        if name not in header:
+            header.append(name)
+
+    for projection in projections:
+        if isinstance(projection.expression, Star):
+            for name in input_columns:
+                add(name)
+        else:
+            add(_projection_label(projection))
+    return header
 
 
 def _merged_row(
@@ -309,12 +302,27 @@ def _execute_join(node: object, tables: dict[str, Table]) -> tuple[list[str], li
 
     # One canonical order regardless of algorithm: logical left original order, then right.
     pairs.sort(key=lambda item: (item[0], item[1]))
-    columns: list[str] = []
-    for _, _, row in pairs:
-        for name in row:
-            if name not in columns:
-                columns.append(name)
+    # The schema comes from the two inputs' known scan columns, never from the emitted pairs: a join
+    # with no matching keys (or an empty input) must still report every output column, and hash-join
+    # in either build direction plus index-nested-loop join must publish the same list.
+    if isinstance(node, HashJoin):
+        columns = _qualified_columns(node.left_table, left_columns, node.right_table, right_columns)
+    elif node.outer_side == "left":
+        columns = _qualified_columns(node.left_table, outer_columns, node.right_table, node.inner_columns)
+    else:
+        columns = _qualified_columns(node.left_table, node.inner_columns, node.right_table, outer_columns)
     return columns, [row for _, _, row in pairs]
+
+
+def _qualified_columns(
+    left_table: str,
+    left_columns: Iterable[str],
+    right_table: str,
+    right_columns: Iterable[str],
+) -> list[str]:
+    columns = [f"{left_table}.{name}" for name in left_columns]
+    columns.extend(f"{right_table}.{name}" for name in right_columns)
+    return columns
 
 
 def _hash_by_key(rows: list[dict[str, object]], positions: list[int], key: str) -> dict[object, list[tuple[int, dict[str, object]]]]:

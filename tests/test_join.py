@@ -216,6 +216,78 @@ class JoinExecutionTests(unittest.TestCase):
             ],
         )
         self.assertEqual(len(rows), 1)
+        self.assertTrue(all(list(row.keys()) == columns for row in rows))
+
+    def test_star_columns_survive_a_join_that_matches_nothing(self) -> None:
+        sql = "SELECT * FROM orders INNER JOIN customers ON orders.cid = customers.cid WHERE orders.id < 0"
+        columns, rows = execute(plan(parse(sql), catalog()).physical, tables())
+        self.assertEqual(
+            columns,
+            [
+                "orders.amount",
+                "orders.cid",
+                "orders.id",
+                "orders.note",
+                "customers.cid",
+                "customers.id_only",
+                "customers.name",
+            ],
+        )
+        self.assertEqual(rows, [])
+        self.assertNotIn("*", columns)
+
+    def test_star_columns_agree_between_hash_and_index_nested_loop_on_zero_rows(self) -> None:
+        indexed = Catalog()
+        indexed.add(TableInfo("customers", ("cid", "name"), 2, {"cid": 2}))
+        indexed.add(TableInfo("orders", ("id", "cid", "amount"), 40, {"cid": 2, "id": 40}, ("cid",)))
+        plain = Catalog()
+        plain.add(TableInfo("customers", ("cid", "name"), 2, {"cid": 2}))
+        plain.add(TableInfo("orders", ("id", "cid", "amount"), 40, {"cid": 2, "id": 40}))
+        joined = {
+            "customers": Table("customers", ("cid", "name"), [{"cid": 1, "name": "a"}, {"cid": 2, "name": "b"}]),
+            "orders": Table(
+                "orders",
+                ("id", "cid", "amount"),
+                [{"id": i, "cid": (i % 2) + 1, "amount": float(i)} for i in range(1, 41)],
+            ),
+        }
+        sql = (
+            "SELECT * FROM customers INNER JOIN orders ON customers.cid = orders.cid "
+            "WHERE customers.name = 'gone'"
+        )
+        indexed_plan = plan(parse(sql), indexed)
+        plain_plan = plan(parse(sql), plain)
+        self.assertIsInstance(indexed_plan.physical.input, IndexNestedLoopJoin)
+        self.assertIsInstance(plain_plan.physical.input, HashJoin)
+        # neither algorithm produces a row, but both must still publish the full left-then-right schema
+        self.assertEqual(execute(indexed_plan.physical, joined), execute(plain_plan.physical, joined))
+        columns, rows = execute(indexed_plan.physical, joined)
+        self.assertEqual(rows, [])
+        self.assertEqual(columns, ["customers.cid", "customers.name", "orders.id", "orders.cid", "orders.amount"])
+
+    def test_star_and_explicit_projections_expand_in_select_position(self) -> None:
+        sql = (
+            "SELECT orders.id, *, customers.name AS who FROM orders "
+            "INNER JOIN customers ON orders.cid = customers.cid WHERE orders.id = 2"
+        )
+        columns, rows = execute(plan(parse(sql), catalog()).physical, tables())
+        # the leading explicit column keeps its position, the star fills left-then-right qualified
+        # columns in the middle (its duplicate orders.id collapses to the first key), the alias is last
+        self.assertEqual(
+            columns,
+            [
+                "id",
+                "orders.amount",
+                "orders.cid",
+                "orders.id",
+                "orders.note",
+                "customers.cid",
+                "customers.id_only",
+                "customers.name",
+                "who",
+            ],
+        )
+        self.assertTrue(all(list(row.keys()) == columns for row in rows))
 
     def test_group_and_aggregate_over_a_join(self) -> None:
         sql = (

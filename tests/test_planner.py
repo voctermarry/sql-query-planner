@@ -167,6 +167,40 @@ class ExecutionTests(unittest.TestCase):
         _, rows = self.run_query("SELECT count(*) FROM orders WHERE id > 100")
         self.assertEqual(rows, [{"count(*)": 0}])
 
+    def test_star_expands_to_every_scan_column(self) -> None:
+        columns, rows = self.run_query("SELECT * FROM orders")
+        self.assertEqual(columns, ["id", "region", "amount"])
+        self.assertTrue(all(list(row.keys()) == columns for row in rows))
+
+    def test_star_columns_survive_a_filter_that_removes_every_row(self) -> None:
+        columns, rows = self.run_query("SELECT * FROM orders WHERE id > 100")
+        self.assertEqual(columns, ["id", "region", "amount"])
+        self.assertEqual(rows, [])
+
+    def test_star_columns_survive_limit_zero(self) -> None:
+        columns, rows = self.run_query("SELECT * FROM orders LIMIT 0")
+        self.assertEqual(columns, ["id", "region", "amount"])
+        self.assertEqual(rows, [])
+
+    def test_star_and_explicit_projection_expand_in_position_and_dedup(self) -> None:
+        columns, rows = self.run_query("SELECT *, id AS pk, region FROM orders LIMIT 1")
+        # the star contributes all scan columns first; the later unaliased `region` is swallowed by the
+        # JSON-object duplicate-key rule, while the distinct alias `pk` survives at the end
+        self.assertEqual(columns, ["id", "region", "amount", "pk"])
+        self.assertTrue(all(list(row.keys()) == columns for row in rows))
+
+    def test_star_never_emits_a_literal_asterisk_label(self) -> None:
+        columns, _ = self.run_query("SELECT * FROM orders WHERE id > 100")
+        self.assertNotIn("*", columns)
+
+    def test_pure_star_over_a_table_without_columns_is_empty(self) -> None:
+        built = Catalog()
+        built.add(TableInfo(name="blank", columns=(), rows=0))
+        blank = {"blank": Table("blank", (), [])}
+        columns, rows = execute(plan(parse("SELECT * FROM blank"), built).physical, blank)
+        self.assertEqual(columns, [])
+        self.assertEqual(rows, [])
+
 
 if __name__ == "__main__":
     unittest.main()

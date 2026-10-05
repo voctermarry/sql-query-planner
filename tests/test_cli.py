@@ -77,6 +77,20 @@ class CLITests(unittest.TestCase):
         code, _, _ = run_cli(["run", "--sql", "SELECT id FROM orders WHERE id > 99", "--table", self.table])
         self.assertEqual(code, EXIT_NEGATIVE)
 
+    def test_run_star_reports_columns_even_with_no_rows(self) -> None:
+        code, out, _ = run_cli(["run", "--sql", "SELECT * FROM orders WHERE id > 99", "--table", self.table])
+        self.assertEqual(code, EXIT_NEGATIVE)
+        document = json.loads(out)
+        self.assertEqual(document["columns"], ["amount", "id", "region"])
+        self.assertEqual(document["rows"], [])
+
+    def test_run_star_reports_columns_with_limit_zero(self) -> None:
+        code, out, _ = run_cli(["run", "--sql", "SELECT * FROM orders LIMIT 0", "--table", self.table])
+        self.assertEqual(code, EXIT_NEGATIVE)
+        document = json.loads(out)
+        self.assertEqual(document["columns"], ["amount", "id", "region"])
+        self.assertEqual(document["rows"], [])
+
     def test_run_writes_the_output_file_atomically(self) -> None:
         target = os.path.join(self.directory.name, "out.jsonl")
         code, out, _ = run_cli(["run", "--sql", "SELECT id FROM orders", "--table", self.table, "--output", target])
@@ -200,6 +214,35 @@ class JoinCLITests(unittest.TestCase):
         self.assertEqual(first["joinOrder"], ["customers", "orders"])
         self.assertEqual(second["joinOperator"], "hash-join")
         self.assertIn("orders", second["joinOrder"])
+
+    def test_run_star_join_reports_qualified_columns_with_zero_rows(self) -> None:
+        sql = (
+            "SELECT * FROM orders INNER JOIN customers ON orders.cid = customers.cid "
+            "WHERE orders.id > 9999"
+        )
+        code, out, _ = run_cli(["run", "--sql", sql, *self.bindings(), "--index", "customers.cid"])
+        self.assertEqual(code, EXIT_NEGATIVE)
+        document = json.loads(out)
+        self.assertEqual(
+            document["columns"],
+            ["orders.amount", "orders.cid", "orders.id", "customers.cid", "customers.name"],
+        )
+        self.assertEqual(document["rows"], [])
+
+    def test_reconcile_star_join_with_no_matches_agrees_across_join_operators(self) -> None:
+        # The index flips one plan to index-nested-loop join; the empty outer side means zero rows in
+        # both, yet reconciliation must compare the schema too and stay identical.
+        sql = (
+            "SELECT * FROM customers INNER JOIN orders ON customers.cid = orders.cid "
+            "WHERE customers.name = 'absent'"
+        )
+        code, out, _ = run_cli(["reconcile", "--sql", sql, *self.bindings(), "--index", "orders.cid"])
+        self.assertEqual(code, EXIT_OK)
+        document = json.loads(out)
+        self.assertTrue(document["identical"])
+        self.assertEqual(document["rows"], 0)
+        self.assertEqual(document["plans"][0]["joinOperator"], "index-nested-loop-join")
+        self.assertEqual(document["plans"][1]["joinOperator"], "hash-join")
 
     def test_missing_binding_is_a_validation_error(self) -> None:
         code, _, err = run_cli(["plan", "--sql", self.JOIN_SQL, "--table", f"orders={self.orders}"])
